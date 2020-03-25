@@ -24,29 +24,44 @@ import (
 )
 
 var (
-	testVtOpts = vtOptions{
+	baseComposeFilePath = "./docker-compose.base.yml"
+	referenceFile       string
+	testVtOpts          = vtOptions{
 		webPort:       DefaultWebPort,
 		gRpcPort:      DefaultGrpcPort,
 		mySqlPort:     DefaultMysqlPort,
 		topologyFlags: DefaultTopologyFlags,
 		cell:          DefaultCell,
 	}
-	testComposeFile       = readFile("./docker-compose.base.yml")
+
 	testKeyspaceInfoMap   = parseKeyspaceInfo(DefaultKeyspaceData)
 	testExternalDbInfoMap = parseExternalDbData(DefaultExternalDbData)
-	referenceFile         string
 )
 
 func TestGenerateCorrectFileWithDefaultOpts(t *testing.T) {
-	baseFile := testComposeFile
+	baseFile := readFile(baseComposeFilePath)
 	finalFile := applyDockerComposePatches(baseFile, testKeyspaceInfoMap, testExternalDbInfoMap, testVtOpts)
 
 	yamlString := string(finalFile)
 	assert.YAMLEq(t, referenceFile, yamlString)
 }
 
+func TestDoesNotMutateArgs(t *testing.T) {
+	baseFile := readFile(baseComposeFilePath)
+	refBaseFile := make([]byte, len(baseFile))
+	copy(refBaseFile, baseFile)
+	refKeyspaceMap := testKeyspaceInfoMap
+	refExternalDbMap := testExternalDbInfoMap
+
+	applyDockerComposePatches(baseFile, testKeyspaceInfoMap, testExternalDbInfoMap, testVtOpts)
+
+	assert.Equal(t, baseFile, refBaseFile)
+	assert.Equal(t, testKeyspaceInfoMap, refKeyspaceMap)
+	assert.Equal(t, testExternalDbInfoMap, refExternalDbMap)
+}
+
 func TestOptsAppliedThroughoutGeneratedFile(t *testing.T) {
-	baseFile := testComposeFile
+	baseFile := readFile(baseComposeFilePath)
 	options := vtOptions{
 		webPort:       55_555,
 		gRpcPort:      66_666,
@@ -72,6 +87,49 @@ func TestOptsAppliedThroughoutGeneratedFile(t *testing.T) {
 
 	assert.Contains(t, yamlString, fmt.Sprintf("- TOPOLOGY_FLAGS=%s", options.topologyFlags))
 	assert.NotContains(t, yamlString, DefaultTopologyFlags)
+}
+
+func TestDebugOptChanges(t *testing.T) {
+	baseFile := readFile(baseComposeFilePath)
+	opts := vtOptions{
+		webPort:       DefaultWebPort,
+		gRpcPort:      DefaultGrpcPort,
+		mySqlPort:     DefaultMysqlPort,
+		topologyFlags: DefaultTopologyFlags,
+		cell:          DefaultCell,
+		debug:         false,
+	}
+	debugOpts := opts
+	debugOpts.debug = true
+
+	// Debug mode.
+	finalFile := applyDockerComposePatches(baseFile, testKeyspaceInfoMap, testExternalDbInfoMap, debugOpts)
+	yamlString := string(finalFile)
+
+	assert.Contains(t, yamlString, "image: vitess/debug")
+	assert.NotContains(t, yamlString, "image: vitess/base")
+	assert.Contains(t, yamlString, "seccomp:unconfined")
+	assert.NotContains(t, yamlString, "/script/run-forever.sh $$VTROOT/bin/vtgate")
+	assert.Contains(t, yamlString, "dlv --listen=:40000 --headless=true --api-version=2 exec $$VTROOT/bin/vtgate")
+	assert.Contains(t, yamlString, `- 40000:40000`)
+	assert.NotContains(t, yamlString, "- $$VTROOT/bin/vtworker")
+	assert.Contains(t, yamlString, "- 'dlv --listen=:40001 --headless=true --api-version=2 exec $$VTROOT/bin/vtworker")
+	assert.Contains(t, yamlString, `- 40001:40001`)
+
+	// Regular mode.
+	baseFile = readFile(baseComposeFilePath)
+	finalFile = applyDockerComposePatches(baseFile, testKeyspaceInfoMap, testExternalDbInfoMap, opts)
+	yamlString = string(finalFile)
+
+	assert.NotContains(t, yamlString, "image: vitess/debug")
+	assert.Contains(t, yamlString, "image: vitess/base")
+	assert.NotContains(t, yamlString, "seccomp:unconfined")
+	assert.Contains(t, yamlString, "/script/run-forever.sh $$VTROOT/bin/vtgate")
+	assert.NotContains(t, yamlString, "dlv --listen=:40000 --headless=true --api-version=2 exec $$VTROOT/bin/vtgate")
+	assert.NotContains(t, yamlString, `- 40000:40000`)
+	assert.Contains(t, yamlString, "- '$$VTROOT/bin/vtworker")
+	assert.NotContains(t, yamlString, "- 'dlv --listen=:40001 --headless=true --api-version=2 exec $$VTROOT/bin/vtworker")
+	assert.NotContains(t, yamlString, `- 40001:40001`)
 }
 
 func init() {

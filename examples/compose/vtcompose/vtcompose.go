@@ -50,6 +50,7 @@ const (
 	cellUsage           = "Vitess Cell name"
 	keyspaceDataUsage   = "List of keyspace_name/external_db_name:num_of_shards:num_of_replica_tablets:schema_files:<optional>lookup_keyspace_name separated by ';'"
 	externalDbDataUsage = "List of Data corresponding to external DBs. List of <external_db_name>,<DB_HOST>,<DB_PORT>,<DB_USER>,<DB_PASS>,<DB_CHARSET> separated by ';'"
+	debugUsage          = "If true, use the vitess/debug image and expose ports 40000 (vtgate) and 40001 (vtworker) for remote debugging with delve"
 )
 
 var (
@@ -65,6 +66,7 @@ var (
 	cell           = flag.String("cell", DefaultCell, cellUsage)
 	keyspaceData   = flag.String("keyspaceData", DefaultKeyspaceData, keyspaceDataUsage)
 	externalDbData = flag.String("externalDbData", DefaultExternalDbData, externalDbDataUsage)
+	debug          = flag.Bool("debug", false, debugUsage)
 )
 
 type vtOptions struct {
@@ -73,6 +75,7 @@ type vtOptions struct {
 	mySqlPort     int
 	topologyFlags string
 	cell          string
+	debug         bool
 }
 
 type keyspaceInfo struct {
@@ -488,12 +491,15 @@ func generateDefaultTablet(tabAlias int, shard, role, keyspace string, dbInfo ex
 	if dbInfo.dbName != "" {
 		externalDb = "1"
 	}
-
+	image := "base"
+	if opts.debug {
+		image = "debug"
+	}
 	return fmt.Sprintf(`
 - op: add
   path: /services/vttablet%[1]d
   value:
-    image: vitess/base
+    image: vitess/%[15]s
     ports:
     - "15%[1]d:%[4]d"
     - "%[5]d"
@@ -523,15 +529,19 @@ func generateDefaultTablet(tabAlias int, shard, role, keyspace string, dbInfo ex
         interval: 30s
         timeout: 10s
         retries: 15
-`, tabAlias, shard, role, opts.webPort, opts.gRpcPort, keyspace, opts.topologyFlags, opts.cell, externalDb, dbInfo.dbPort, dbInfo.dbHost, dbInfo.dbUser, dbInfo.dbPass, dbInfo.dbCharset)
+`, tabAlias, shard, role, opts.webPort, opts.gRpcPort, keyspace, opts.topologyFlags, opts.cell, externalDb, dbInfo.dbPort, dbInfo.dbHost, dbInfo.dbUser, dbInfo.dbPass, dbInfo.dbCharset, image)
 }
 
 func generateVtctld(opts vtOptions) string {
+	image := "base"
+	if opts.debug {
+		image = "debug"
+	}
 	return fmt.Sprintf(`
 - op: add
   path: /services/vtctld
   value:
-    image: vitess/base
+    image: vitess/%[5]s
     ports:
       - "15000:%[1]d"
       - "%[2]d"
@@ -554,20 +564,34 @@ func generateVtctld(opts vtOptions) string {
       - consul1
       - consul2
       - consul3
-`, opts.webPort, opts.gRpcPort, opts.topologyFlags, opts.cell)
+`, opts.webPort, opts.gRpcPort, opts.topologyFlags, opts.cell, image)
 }
 
 func generateVtgate(opts vtOptions) string {
-	return fmt.Sprintf(`
-- op: add
-  path: /services/vtgate
-  value:
-    image: vitess/base
-    ports:
+	image := "base"
+	vtGateCommand := "$$VTROOT/bin/vtgate"
+	command := fmt.Sprintf("/script/run-forever.sh %s", vtGateCommand)
+	portsList := fmt.Sprintf(`
       - "15099:%[1]d"
       - "%[2]d"
       - "15306:%[3]d"
-    command: ["sh", "-c", "/script/run-forever.sh $$VTROOT/bin/vtgate \
+`, opts.webPort, opts.gRpcPort, opts.mySqlPort)
+
+	if opts.debug {
+		image = "debug"
+		command = fmt.Sprintf("dlv --listen=:40000 --headless=true --api-version=2 exec %s --", vtGateCommand)
+		portsList += `
+      - "40000:40000"
+`
+	}
+
+	vtGateConfig := fmt.Sprintf(`
+- op: add
+  path: /services/vtgate
+  value:
+    image: vitess/%[6]s
+    ports: %[7]s
+    command: ["sh", "-c", "%[8]s \
         %[4]s \
         -logtostderr=true \
         -port %[1]d \
@@ -586,19 +610,42 @@ func generateVtgate(opts vtOptions) string {
       - .:/script
     depends_on:
       - vtctld
-`, opts.webPort, opts.gRpcPort, opts.mySqlPort, opts.topologyFlags, opts.cell)
+`, opts.webPort, opts.gRpcPort, opts.mySqlPort, opts.topologyFlags, opts.cell, image, portsList, command)
+
+	if opts.debug {
+		vtGateConfig += `
+    security_opt:
+      - seccomp:unconfined
+`
+	}
+
+	return vtGateConfig
 }
 
 func generateVtwork(opts vtOptions) string {
+	image := "base"
+	vtWorkerCommand := "$$VTROOT/bin/vtworker"
+	command := vtWorkerCommand
+	portsList := fmt.Sprintf(`
+    ports:
+      - "15100:%[1]d"
+      - "%[2]d"
+`, opts.webPort, opts.gRpcPort)
+
+	if opts.debug {
+		command = fmt.Sprintf("dlv --listen=:40001 --headless=true --api-version=2 exec %s --", vtWorkerCommand)
+		image = "debug"
+		portsList += `
+      - "40001:40001"
+`
+	}
 	return fmt.Sprintf(`
 - op: add
   path: /services/vtwork
   value:
-    image: vitess/base
-    ports:
-      - "15100:%[1]d"
-      - "%[2]d"
-    command: ["sh", "-c", "$$VTROOT/bin/vtworker \
+    image: vitess/%[5]s
+    ports: %[6]s
+    command: ["sh", "-c", "%[7]s \
         %[3]s \
         -cell %[4]s \
         -logtostderr=true \
@@ -610,7 +657,7 @@ func generateVtwork(opts vtOptions) string {
         "]
     depends_on:
       - vtctld
-`, opts.webPort, opts.gRpcPort, opts.topologyFlags, opts.cell)
+`, opts.webPort, opts.gRpcPort, opts.topologyFlags, opts.cell, image, portsList, command)
 }
 
 func generateSchemaload(
@@ -623,10 +670,14 @@ func generateSchemaload(
 	targetTab := tabletAliases[0]
 	schemaFileName := fmt.Sprintf("%s_schema_file.sql", keyspace)
 	externalDb := "0"
+	image := "base"
 
 	if dbInfo.dbName != "" {
 		schemaFileName = ""
 		externalDb = "1"
+	}
+	if opts.debug {
+		image = "debug"
 	}
 
 	// Formatting for list in yaml
@@ -639,7 +690,7 @@ func generateSchemaload(
 - op: add
   path: /services/schemaload_%[7]s
   value:
-    image: vitess/base
+    image: vitess/%[11]s
     volumes:
       - ".:/script"
     environment:
@@ -656,7 +707,7 @@ func generateSchemaload(
       - EXTERNAL_DB=%[10]s
     command: ["sh", "-c", "/script/schemaload.sh"]
     %[1]s
-`, dependsOn, targetTab, opts.topologyFlags, opts.webPort, opts.gRpcPort, opts.cell, keyspace, postLoadFile, schemaFileName, externalDb)
+`, dependsOn, targetTab, opts.topologyFlags, opts.webPort, opts.gRpcPort, opts.cell, keyspace, postLoadFile, schemaFileName, externalDb, image)
 }
 
 func generatePrimaryVIndex(tableName, column, name string) string {
